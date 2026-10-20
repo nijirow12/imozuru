@@ -9,6 +9,12 @@
 .md にする（場所を時刻で指せるように）。X はログインの壁で本文が取れないので、
 取りに行かずに FAIL を返す。
 
+PDF も sources/ には .md だけを残す。pdftotext（-layout なし）で起こし、ページの境目に
+`<!-- p.N -->` の行を入れる。-layout は見た目を保つための空白が本文の 22〜70% を占め
+（woolpower の取説・カタログ・2026-10-20）、読むたびにトークンを食っていた。2段組の左右が
+1行に混ざることも無くなる。PDF 本体は ~/.cache/imozuru/<話題>/ に移す（Obsidian や git に
+数 MB の PDF を入れないため）。表の形を見たいときは、その PDF に pdftotext -layout をかけ直す。
+
 使い方:
     fetch.py <sources_dir> <name> <url>
 出力（標準出力に1行・タブ区切り）:
@@ -17,6 +23,7 @@
 """
 
 import codecs
+import os
 import re
 import shutil
 import subprocess
@@ -114,18 +121,35 @@ def missing(*commands: str) -> list[str]:
     return [c for c in commands if shutil.which(c) is None]
 
 
+def cache_dir(topic: str) -> Path:
+    """PDF 本体の置き場。sources/ の外（Obsidian の保管庫や git に入らない所）に置く。"""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "imozuru" / topic
+
+
+def pages_to_md(pages: list[str]) -> str:
+    """ページごとの本文を、境目に `<!-- p.N -->` の行を入れてつなぐ。行末の空白と3行以上の空行は詰める。"""
+    out = []
+    for n, page in enumerate(pages, 1):
+        if not page.strip():
+            continue
+        text = re.sub(r"\n{3,}", "\n\n", "\n".join(line.rstrip() for line in page.split("\n")))
+        out.append(f"<!-- p.{n} -->\n{text.strip()}")
+    return "\n\n".join(out) + "\n" if out else ""
+
+
 def pdf_to_text(pdf: Path) -> str:
-    """pdftotext で段組みを保ったまま文字にする。行番号で原文を指せるように -layout を使う。
+    """pdftotext で読む順に文字にする（-layout は使わない・冒頭の説明）。
 
     Xpdf の pdftotext（Git for Windows に入っている）は既定で Latin-1 を出すので、
     -enc UTF-8 で出力の文字コードを決める。poppler の pdftotext も同じ引数を受け付ける（#3）。
+    ページの境目は pdftotext が出す改ページ（\\f）で見分ける。
     """
     if missing("pdftotext"):
         return ""
-    out = pdf.with_suffix(".txt")
-    subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(pdf), str(out)], check=False,
-                   stderr=subprocess.DEVNULL)
-    return out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
+    res = subprocess.run(["pdftotext", "-enc", "UTF-8", str(pdf), "-"], capture_output=True,
+                         check=False)
+    return pages_to_md(res.stdout.decode("utf-8", errors="replace").split("\f"))
 
 
 def ocr_pdf(pdf: Path) -> str:
@@ -133,7 +157,7 @@ def ocr_pdf(pdf: Path) -> str:
 
     Spencer ら 1995 の PDF は取れたのに pdftotext が1文字しか返さなかった（2026-10-10）。
     英語だけ（入っている言語データが eng のみ）。1ページずつ 200dpi の画像にして読む。
-    OCR の誤りは残るので、.txt の先頭に OCR だと書いて、読む人が原本と照らせるようにする。
+    OCR の誤りは残るので、.md の頭に OCR だと書いて、読む人が原本と照らせるようにする（write_pdf_md）。
     pdftoppm か tesseract が無ければ何もせず空を返す（呼び手が FAIL に無いコマンドを書く）。
     """
     if missing("pdftoppm", "tesseract"):
@@ -146,14 +170,20 @@ def ocr_pdf(pdf: Path) -> str:
     for img in sorted(tmp.glob("p-*.png")):
         res = subprocess.run(["tesseract", str(img), "-", "-l", "eng"],
                              capture_output=True, encoding="utf-8", errors="replace")
-        pages.append(f"=== page {img.stem.split('-')[-1]} ===\n{res.stdout}")
+        pages.append(res.stdout)
         img.unlink()
     tmp.rmdir()
-    text = "\n".join(pages)
-    out = pdf.with_suffix(".txt")
-    out.write_text("（OCR で起こした本文。誤りが残るので、引用は原本の PDF で確かめる）\n\n" + text,
+    return pages_to_md(pages)
+
+
+def write_pdf_md(out: Path, body: str, url: str, pdf_copy: Path, ocr: bool) -> None:
+    """PDF から起こした本文を、元の URL と PDF の写しの場所つきで .md に書く。"""
+    how = ("OCR（tesseract）で起こした本文。誤りが残るので、引用は PDF の写しで確かめる"
+           if ocr else "pdftotext（-layout なし）で起こした本文。表の形は PDF の写しで見る")
+    home = Path.home()
+    shown = f"~/{pdf_copy.relative_to(home)}" if pdf_copy.is_relative_to(home) else str(pdf_copy)
+    out.write_text(f"# {out.stem}\n\n- 元: {url}\n- PDF の写し: {shown}\n- {how}\n\n{body}",
                    encoding="utf-8")
-    return text
 
 
 HAS_AX = shutil.which("ax") is not None
@@ -346,9 +376,14 @@ def first_line(text: str) -> str:
 
 
 def save_verified(saved: Path, kept: Path, destination: Path) -> Path:
-    """検査を通ったファイルだけを、同じファイルシステム内で保存先に移す。"""
+    """検査を通ったファイルだけを保存先に移す。PDF 本体は sources/ ではなくキャッシュへ移す。"""
     if saved != kept:
-        saved.replace(destination / saved.name)
+        if saved.suffix == ".pdf":
+            cache = cache_dir(destination.resolve().parent.name)
+            cache.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(saved), str(cache / saved.name))  # 別のディスクのこともあるので move
+        else:
+            saved.replace(destination / saved.name)
     target = destination / kept.name
     kept.replace(target)
     return target
@@ -362,6 +397,16 @@ def valid_source_name(name: str) -> bool:
             and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name)
             and device not in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
             and not re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", device))
+
+
+def pdf_source(saved: Path, url: str, destination: Path, ocr_ok: bool = True) -> tuple[Path, str]:
+    """保存した PDF を起こして .md を書く。文字の層が無ければ OCR する。(.md の場所, 本文) を返す。"""
+    text, ocr = pdf_to_text(saved), False
+    if len(text.strip()) < 200 and ocr_ok:
+        text, ocr = ocr_pdf(saved), True
+    kept = saved.with_suffix(".md")
+    write_pdf_md(kept, text, url, cache_dir(destination.resolve().parent.name) / saved.name, ocr)
+    return kept, text
 
 
 def fetch_source(sources: Path, name: str, url: str, destination: Path) -> int:
@@ -401,10 +446,8 @@ def fetch_source(sources: Path, name: str, url: str, destination: Path) -> int:
     if body[:5] == b"%PDF-":
         saved = sources / f"{name}.pdf"
         saved.write_bytes(body)
-        text = pdf_to_text(saved)
-        kept = saved.with_suffix(".txt")
-        if len(text.strip()) < 200 and not re.search(r"arxiv\.org", url):
-            text = ocr_pdf(saved)  # 文字の層が無い PDF。arXiv は下で HTML 版に切り替える
+        # 文字の層が無い PDF は OCR する。arXiv は下で HTML 版に切り替える
+        kept, text = pdf_source(saved, url, destination, ocr_ok=not re.search(r"arxiv\.org", url))
     elif ctype.startswith(("text/plain", "text/markdown", "application/json", "text/csv")):
         # GitHub の README やデータ（raw.githubusercontent.com）はこの形で来る
         # （和田三造の配色のデータで FAIL した・2026-10-10）。中身をそのまま残す。
@@ -423,10 +466,7 @@ def fetch_source(sources: Path, name: str, url: str, destination: Path) -> int:
             kept.unlink(missing_ok=True)
             saved = sources / f"{name}.pdf"
             if ax_save(url, saved) and saved.read_bytes()[:5] == b"%PDF-":
-                text = pdf_to_text(saved)
-                kept = saved.with_suffix(".txt")
-                if len(text.strip()) < 200:
-                    text = ocr_pdf(saved)
+                kept, text = pdf_source(saved, url, destination)
             else:
                 saved.unlink(missing_ok=True)
                 print(f"FAIL\t{name}\t転送先の PDF を保存できなかった")
