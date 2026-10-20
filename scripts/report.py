@@ -56,7 +56,7 @@ def verify(src_dir: Path, q: dict) -> tuple[bool, list[str], int, int]:
     start = max(1, q["line"] - 2)
     end = min(len(lines), q.get("end", q["line"]) + 2)
     region = norm(" ".join(lines[start - 1:end]))
-    # 2段組の PDF は左右の段が1行に混ざり、何行かにまたがる文はそのままでは照合できない
+    # 2段組の PDF を -layout で起こした古い .txt は左右の段が1行に混ざり、何行かにまたがる文はそのままでは照合できない
     # （Yoshida 2008 で起きた）。抜き書きを「…」で区切れば、区切りごとに順に照らす。
     # 区切りはページにも「…」として残るので、省いたことが読む人に見える。
     pieces = [norm(p) for p in q["text"].split("…") if norm(p)]
